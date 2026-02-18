@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>QRスキャナ（Surface用・自動コピー＋保険・連続読み取り）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- ZXing ブラウザ版ライブラリ（UMD） -->
+  <script src="https://unpkg.com/@zxing/browser@latest"></script>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; margin: 16px; }
+    #video { width: 100%; max-width: 520px; aspect-ratio: 4/3; background: #000; border-radius: 8px; }
+    #msg { margin-top: 12px; font-weight: 600; }
+    .ok { color: #0a8; } .warn { color: #c60; } .err { color: #c00; }
+    #tips { margin-top: 8px; font-size: .9em; opacity: .85; }
+    #result { margin-top: 10px; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-family: ui-monospace,Consolas,monospace; }
+    #actions { margin-top: 8px; display: none; }
+    button { padding: 8px 12px; margin-right: 8px; }
+    #devices { margin: 8px 0; display: none; }
+  </style>
+</head>
+<body>
+  <h2>QRをかざしてください</h2>
+  <video id="video" muted playsinline></video>
+  <div id="msg" class="warn">初回は「カメラ」と「クリップボード」の許可を求められます。</div>
+  <div id="tips">読み取れたら自動コピーを試みます。失敗時は［手動でコピー］を押してください。</div>
+
+  <div id="devices">
+    <label for="cam">カメラ選択：</label>
+    <select id="cam"></select>
+  </div>
+
+  <div id="result" style="display:none"></div>
+  <div id="actions">
+    <button id="copyBtn">手動でコピー</button>
+    <button id="stopBtn">カメラ停止</button>
+  </div>
+
+  <script>
+    (async () => {
+      const msg = (t, cls) => { const m = document.getElementById('msg'); m.textContent = t; m.className = cls || ''; };
+      const resultBox = document.getElementById('result');
+      const actions = document.getElementById('actions');
+      const copyBtn = document.getElementById('copyBtn');
+      const stopBtn = document.getElementById('stopBtn');
+      const video = document.getElementById('video');
+
+      // ★変更: 状態管理用のフラグと値を追加
+      let currentDeviceId = null;           // 選択中のカメラID
+      let manuallyStopped = false;          // 手動停止フラグ（これがtrueなら自動再開しない）
+      let lastText = "";                    // 直近に読み取ったテキスト（重複防止）
+      let lastDetectedAt = 0;               // 直近検出時刻（重複防止）
+      const RESUME_DELAY_MS = 1000;         // ★変更: 1秒で次を読む
+      const DUP_SUPPRESS_MS = 1200;         // ★変更: 1.2秒以内の同一内容は抑制
+
+      // HTTPS/localhost チェック
+      if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+        msg("HTTPSで開いてください（カメラAPIはHTTPS/localhostのみ動作）", "err");
+        return;
+      }
+
+      // カメラ権限チェック
+      try {
+        await navigator.mediaDevices.getUserMedia({ video: true });
+      } catch (e) {
+        msg("カメラの許可が必要です。アドレスバーの鍵→『カメラ：許可』にしてください。", "err");
+        return;
+      }
+
+      const codeReader = new ZXingBrowser.BrowserQRCodeReader();
+
+      // カメラ列挙
+      try {
+        const devices = await ZXingBrowser.BrowserCodeReader.listVideoInputDevices();
+        if (devices && devices.length > 1) {
+          const sel = document.getElementById('cam');
+          const wrap = document.getElementById('devices');
+          devices.forEach((d,i) => {
+            const opt = document.createElement('option');
+            opt.value = d.deviceId;
+            opt.textContent = d.label || `camera-${i+1}`;
+            sel.appendChild(opt);
+          });
+          wrap.style.display = 'block';
+          sel.onchange = () => {
+            currentDeviceId = sel.value;
+            startScan(currentDeviceId);
+          };
+          currentDeviceId = devices[0].deviceId;
+          await startScan(currentDeviceId);
+        } else {
+          currentDeviceId = null;
+          await startScan(currentDeviceId);
+        }
+      } catch (e) {
+        console.error(e);
+        msg("カメラ列挙に失敗しました。別アプリがカメラ使用中の可能性があります。", "err");
+        return;
+      }
+
+      async function startScan(deviceId) {
+        if (manuallyStopped) return; // ★変更: 手動停止後は再開しない
+
+        msg("カメラ起動中…", "warn");
+        // 既存セッション停止
+        try { codeReader.reset(); } catch(e){}
+        try {
+          if (video.srcObject) {
+            video.srcObject.getTracks().forEach(t => t.stop());
+            video.srcObject = null;
+          }
+        } catch(e){}
+
+        await codeReader.decodeFromVideoDevice(deviceId, video, async (result, err, controls) => {
+          if (manuallyStopped) {
+            // ★変更: 停止指示が出ていれば直ちに停止
+            try { controls?.stop?.(); } catch(_) {}
+            try { video.srcObject?.getTracks().forEach(t => t.stop()); } catch(_){}
+            return;
+          }
+
+          if (result) {
+            const text = result.getText();
+            const now = Date.now();
+
+            // ★変更: 短時間の重複（同一コード連続）を抑制
+            if (text === lastText && (now - lastDetectedAt) < DUP_SUPPRESS_MS) {
+              return; // 同じものを連続検出しただけなので無視
+            }
+            lastText = text;
+            lastDetectedAt = now;
+
+            // 画面に表示＆ボタン有効化
+            resultBox.style.display = 'block';
+            actions.style.display = 'block';
+            resultBox.textContent = text;
+
+            // 自動コピー（失敗したら手動に誘導）
+            try {
+              await navigator.clipboard.writeText(text);
+              msg("読み取り完了。クリップボードにコピーしました。Excelに戻って［OK］を押してください。", "ok");
+            } catch (e) {
+              msg("読み取り完了。ただしクリップボード書込みに失敗したため、［手動でコピー］を押してください。", "warn");
+            }
+
+            // ★変更: 一旦停止して1秒後に自動再開する
+            try { controls?.stop?.(); } catch(e){}
+            try { video.srcObject?.getTracks().forEach(t => t.stop()); } catch(e){}
+
+            if (!manuallyStopped) {
+              setTimeout(() => {
+                // 同じカメラで再開（ユーザーが途中で選択を変えていれば currentDeviceId が反映される）
+                startScan(currentDeviceId);
+              }, RESUME_DELAY_MS);
+              msg("次のQRを読み取る準備中…（約1秒）", "warn");
+            }
+          } else if (err && !(err instanceof ZXingBrowser.NotFoundException)) {
+            console.error(err);
+          }
+        });
+
+        msg("カメラが起動しました。QRをかざしてください。", "ok");
+      }
+
+      // 手動コピーの保険
+      copyBtn.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(resultBox.textContent || "");
+          msg("手動コピーに成功。Excelに戻って［OK］を押してください。", "ok");
+        } catch (e) {
+          msg("手動コピーに失敗。テキストを手で選択して Ctrl+C を押してください。", "err");
+        }
+      };
+
+      // 手動停止
+      stopBtn.onclick = () => {
+        manuallyStopped = true; // ★変更: 自動再開を止める
+        try { video.srcObject?.getTracks().forEach(t => t.stop()); } catch(e){}
+        try { codeReader.reset(); } catch(e){}
+        msg("カメラを停止しました。", "warn");
+      };
+    })();
+  </script>
+</body>
+</html>
