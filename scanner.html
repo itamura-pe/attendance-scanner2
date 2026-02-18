@@ -128,3 +128,54 @@
           }
           lastText = text;
           lastDetectedAt = now;
+
+          // UI更新
+          resultBox.style.display = 'block';
+          resultBox.textContent = text;
+
+          // 自動コピー
+          try {
+            await navigator.clipboard.writeText(text);
+            msg("読み取り→コピー完了。Excelに戻らなくても次のQRをかざせます。", "ok");
+          } catch (e) {
+            msg("読み取り完了。ただしクリップボード書込みに失敗。［手動でコピー］を押してください。", "warn");
+          }
+
+          // いったん停止してから、短い待ち時間の後に自動再開（連続読取）
+          try { controls?.stop?.(); } catch(e){}
+          try { video.srcObject?.getTracks().forEach(t => t.stop()); } catch(e){}
+
+          if (!manuallyStopped) {
+            msg("次のQRを読み取る準備中…", "warn");
+            setTimeout(() => startScan(deviceId), RESUME_DELAY_MS);
+          }
+        } else if (err && !(err instanceof ZXingBrowser.NotFoundException)) {
+          // 検出以外のエラーだけログ（NotFoundException はフレームごとの未検出）
+          console.error(err);
+        }
+      });
+
+      msg("カメラが起動しました。QRをかざしてください。", "ok");
+    }
+
+    // --- 手動コピーの保険 ---
+    copyBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(resultBox.textContent || "");
+        msg("手動コピーに成功。", "ok");
+      } catch (e) {
+        msg("手動コピーに失敗。テキストを選択して Ctrl+C を押してください。", "err");
+      }
+    };
+
+    // --- 手動停止 ---
+    stopBtn.onclick = () => {
+      manuallyStopped = true;
+      try { video.srcObject?.getTracks().forEach(t => t.stop()); } catch(e){}
+      try { codeReader.reset(); } catch(e){}
+      msg("カメラを停止しました。", "warn");
+    };
+  })();
+  </script>
+</body>
+</html>
