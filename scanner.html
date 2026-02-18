@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <title>QRスキャナ（Surface用・連続読み取り＋履歴）</title>
+  <title>QRスキャナ（Surface用・連続読み取り＋自動コピー）</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <!-- ZXing ブラウザ版ライブラリ（UMD） -->
   <script src="https://unpkg.com/@zxing/browser@latest"></script>
@@ -14,24 +14,16 @@
     .ok { color: #0a8; } .warn { color: #c60; } .err { color: #c00; }
     #tips { margin-top: 8px; font-size: .9em; opacity: .85; }
     #result { margin-top: 10px; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-family: ui-monospace,Consolas,monospace; }
-    #actions { margin-top: 8px; display: none; }
+    #actions { margin-top: 8px; }
     button { padding: 8px 12px; margin-right: 8px; }
     #devices { margin: 8px 0; display: none; }
-    #logWrap { margin-top: 16px; }
-    #logWrap h3 { margin: 0 0 6px; font-size: 1rem; }
-    #log { border: 1px solid #ccc; border-radius: 6px; padding: 8px; max-width: 520px;
-           max-height: 220px; overflow: auto; font-family: ui-monospace,Consolas,monospace; }
-    #log ul { list-style: none; margin: 0; padding: 0; }
-    #log li { border-bottom: 1px dashed #aaa; padding: 6px 0; }
-    #log .ts { color: #666; margin-right: 8px; }
-    #exportBtns { margin-top: 8px; }
   </style>
 </head>
 <body>
   <h2>QRをかざしてください</h2>
   <video id="video" muted playsinline></video>
   <div id="msg" class="warn">初回は「カメラ」と「クリップボード」の許可を求められます。</div>
-  <div id="tips">読み取れたら自動コピーを試みます。失敗時は［手動でコピー］を押してください。</div>
+  <div id="tips">読み取れたら毎回クリップボードに自動コピーします（失敗時は［手動でコピー］）。</div>
 
   <div id="devices">
     <label for="cam">カメラ選択：</label>
@@ -44,212 +36,95 @@
     <button id="stopBtn">カメラ停止</button>
   </div>
 
-  <div id="logWrap">
-    <h3>読み取り履歴</h3>
-    <div id="log"><ul id="logList"></ul></div>
-    <div id="exportBtns">
-      <button id="dlCsvBtn">CSVダウンロード</button>
-      <button id="clearLogBtn">履歴クリア</button>
-    </div>
-  </div>
-
   <script>
-    (async () => {
-      const msg = (t, cls) => { const m = document.getElementById('msg'); m.textContent = t; m.className = cls || ''; };
-      const resultBox = document.getElementById('result');
-      const actions = document.getElementById('actions');
-      const copyBtn = document.getElementById('copyBtn');
-      const stopBtn = document.getElementById('stopBtn');
-      const dlCsvBtn = document.getElementById('dlCsvBtn');
-      const clearLogBtn = document.getElementById('clearLogBtn');
-      const video = document.getElementById('video');
-      const logList = document.getElementById('logList');
+  (async () => {
+    // --- UI参照 ---
+    const msg = (t, cls) => { const m = document.getElementById('msg'); m.textContent = t; m.className = cls || ''; };
+    const video = document.getElementById('video');
+    const resultBox = document.getElementById('result');
+    const copyBtn = document.getElementById('copyBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const camSel = document.getElementById('cam');
+    const camWrap = document.getElementById('devices');
 
-      // 状態
-      let currentDeviceId = null;
-      let manuallyStopped = false;
-      let lastText = "";
-      let lastDetectedAt = 0;
-      const RESUME_DELAY_MS = 1000; // 1秒後に再開
-      const DUP_SUPPRESS_MS = 1200; // 1.2秒以内の同一内容は無視
-      const history = []; // { ts: ISO文字列, text: string } を蓄積（無制限）
+    // --- 設定 ---
+    const RESUME_DELAY_MS = 900;     // 1件読み取ったあと再開する待ち時間
+    const DUP_SUPPRESS_MS = 1200;    // この時間内に同一内容なら重複として無視
+    let lastText = "";
+    let lastDetectedAt = 0;
+    let manuallyStopped = false;
 
-      // HTTPS/localhost チェック
-      if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
-        msg("HTTPSで開いてください（カメラAPIはHTTPS/localhostのみ動作）", "err");
-        return;
+    // --- 事前チェック ---
+    if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+      msg("HTTPSで開いてください（カメラAPIはHTTPS/localhostのみ動作）", "err");
+      return;
+    }
+    try {
+      await navigator.mediaDevices.getUserMedia({ video: true });
+    } catch (e) {
+      msg("カメラの許可が必要です。アドレスバーの鍵→『カメラ：許可』にしてください。", "err");
+      return;
+    }
+
+    // --- ZXing 初期化 ---
+    const codeReader = new ZXingBrowser.BrowserQRCodeReader();
+
+    // --- カメラ列挙＆開始 ---
+    try {
+      const devices = await ZXingBrowser.BrowserCodeReader.listVideoInputDevices();
+      let deviceId = null;
+
+      if (devices && devices.length > 1) {
+        // UI表示
+        camWrap.style.display = 'block';
+        devices.forEach((d, i) => {
+          const opt = document.createElement('option');
+          opt.value = d.deviceId;
+          opt.textContent = d.label || `camera-${i+1}`;
+          camSel.appendChild(opt);
+        });
+        deviceId = devices[0].deviceId;
+        camSel.value = deviceId;
+        camSel.onchange = () => {
+          deviceId = camSel.value;
+          startScan(deviceId);
+        };
       }
+      await startScan(deviceId); // deviceId=null なら既定カメラ
+    } catch (e) {
+      console.error(e);
+      msg("カメラ列挙に失敗しました。別アプリがカメラ使用中の可能性があります。", "err");
+      return;
+    }
 
-      // カメラ権限チェック
+    // --- 連続読み取りのコア ---
+    async function startScan(deviceId) {
+      if (manuallyStopped) return;
+
+      msg("カメラ起動中…", "warn");
+      // 既存セッションを安全に停止
+      try { codeReader.reset(); } catch(e){}
       try {
-        await navigator.mediaDevices.getUserMedia({ video: true });
-      } catch (e) {
-        msg("カメラの許可が必要です。アドレスバーの鍵→『カメラ：許可』にしてください。", "err");
-        return;
-      }
-
-      const codeReader = new ZXingBrowser.BrowserQRCodeReader();
-
-      // カメラ列挙
-      try {
-        const devices = await ZXingBrowser.BrowserCodeReader.listVideoInputDevices();
-        if (devices && devices.length > 1) {
-          const sel = document.getElementById('cam');
-          const wrap = document.getElementById('devices');
-          devices.forEach((d,i) => {
-            const opt = document.createElement('option');
-            opt.value = d.deviceId;
-            opt.textContent = d.label || `camera-${i+1}`;
-            sel.appendChild(opt);
-          });
-          wrap.style.display = 'block';
-          sel.onchange = () => {
-            currentDeviceId = sel.value;
-            startScan(currentDeviceId);
-          };
-          currentDeviceId = devices[0].deviceId;
-          await startScan(currentDeviceId);
-        } else {
-          currentDeviceId = null;
-          await startScan(currentDeviceId);
+        if (video.srcObject) {
+          video.srcObject.getTracks().forEach(t => t.stop());
+          video.srcObject = null;
         }
-      } catch (e) {
-        console.error(e);
-        msg("カメラ列挙に失敗しました。別アプリがカメラ使用中の可能性があります。", "err");
-        return;
-      }
+      } catch(e){}
 
-      // 履歴への追記（先頭に追加）
-      function pushHistory(text) {
-        const ts = new Date().toISOString(); // UTC ISO
-        history.unshift({ ts, text });
-        const li = document.createElement('li');
-        const tsSpan = document.createElement('span');
-        tsSpan.className = 'ts';
-        // ローカル表示用に日本時間に整形
-        tsSpan.textContent = `[${new Date(ts).toLocaleString('ja-JP')}]`;
-        const txtSpan = document.createElement('span');
-        txtSpan.textContent = text;
-        li.appendChild(tsSpan);
-        li.appendChild(txtSpan);
-        // 先頭に挿入
-        if (logList.firstChild) {
-          logList.insertBefore(li, logList.firstChild);
-        } else {
-          logList.appendChild(li);
+      await codeReader.decodeFromVideoDevice(deviceId, video, async (result, err, controls) => {
+        if (manuallyStopped) {
+          try { controls?.stop?.(); } catch(_) {}
+          try { video.srcObject?.getTracks().forEach(t => t.stop()); } catch(_){}
+          return;
         }
-      }
 
-      function exportCsv() {
-        // CSVヘッダー + 各行（ts,text）。textはダブルクォートで囲み、内部のダブルクォートは二重化
-        const rows = [['timestamp(ISO)', 'text']];
-        // 履歴はhistory[0]が最新（unshift）なので、CSVは時系列（古→新）にしたい場合は逆順に
-        for (let i = history.length - 1; i >= 0; i--) {
-          const { ts, text } = history[i];
-          const esc = (s) => `"${String(s).replace(/"/g,'""')}"`;
-          rows.push([ts, text].map(esc));
-        }
-        const csv = rows.map(r => r.join(',')).join('\r\n');
-        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        const dt = new Date();
-        const ymd = dt.toISOString().slice(0,10); // YYYY-MM-DD
-        a.href = url;
-        a.download = `qr_log_${ymd}.csv`;
-        a.click();
-        URL.revokeObjectURL(url);
-      }
+        if (result) {
+          const text = result.getText();
+          const now = Date.now();
 
-      function clearHistory() {
-        history.length = 0;
-        logList.innerHTML = '';
-      }
-
-      async function startScan(deviceId) {
-        if (manuallyStopped) return;
-
-        msg("カメラ起動中…", "warn");
-       er.reset(); } catch(e){}
-        try {
-          if (video.srcObject) {
-            video.srcObject.getTracks().forEach(t => t.stop());
-            video.srcObject = null;
-          }
-        } catch(e){}
-
-        await codeReader.decodeFromVideoDevice(deviceId, video, async (result, err, controls) => {
-          if (manuallyStopped) {
-            try { controls?.stop?.(); } catch(_) {}
-            try { video.srcObject?.getTracks().forEach(t => t.stop()); } catch(_){}
+          // 重複抑止（同一テキストを短時間で再検出したら捨てる）
+          if (text === lastText && (now - lastDetectedAt) < DUP_SUPPRESS_MS) {
             return;
           }
-
-          if (result) {
-            const text = result.getText();
-            const now = Date.now();
-
-            // 重複抑止
-            if (text === lastText && (now - lastDetectedAt) < DUP_SUPPRESS_MS) {
-              return;
-            }
-            lastText = text;
-            lastDetectedAt = now;
-
-            // 表示
-            resultBox.style.display = 'block';
-            actions.style.display = 'block';
-            resultBox.textContent = text;
-
-            // 履歴に追加（何件でも）
-            pushHistory(text);
-
-            // 自動コピー
-            try {
-              await navigator.clipboard.writeText(text);
-              msg("読み取り完了。クリップボードにコピーしました。Excelに戻って［OK］を押してください。", "ok");
-            } catch (e) {
-              msg("読み取り完了。ただしクリップボード書込みに失敗したため、［手動でコピー］を押してください。", "warn");
-            }
-
-            // 一旦停止→1秒後に再開
-            try { controls?.stop?.(); } catch(e){}
-            try { video.srcObject?.getTracks().forEach(t => t.stop()); } catch(e){}
-
-            if (!manuallyStopped) {
-              msg("次のQRを読み取る準備中…（約1秒）", "warn");
-              setTimeout(() => startScan(currentDeviceId), RESUME_DELAY_MS);
-            }
-          } else if (err && !(err instanceof ZXingBrowser.NotFoundException)) {
-            console.error(err);
-          }
-        });
-
-        msg("カメラが起動しました。QRをかざしてください。", "ok");
-      }
-
-      // 手動コピーの保険
-      copyBtn.onclick = async () => {
-        try {
-          await navigator.clipboard.writeText(resultBox.textContent || "");
-          msg("手動コピーに成功。Excelに戻って［OK］を押してください。", "ok");
-        } catch (e) {
-          msg("手動コピーに失敗。テキストを手で選択して Ctrl+C を押してください。", "err");
-        }
-      };
-
-      // 手動停止
-      stopBtn.onclick = () => {
-        manuallyStopped = true;
-        try { video.srcObject?.getTracks().forEach(t => t.stop()); } catch(e){}
-        try { codeReader.reset(); } catch(e){}
-        msg("カメラを停止しました。", "warn");
-      };
-
-      // CSVと履歴クリア
-      dlCsvBtn.onclick = exportCsv;
-      clearLogBtn.onclick = clearHistory;
-    })();
-  </script>
-</body>
-</html>
+          lastText = text;
+          lastDetectedAt = now;
